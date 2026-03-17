@@ -5,7 +5,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/gophercloud/gophercloud"
 	"github.com/gophercloud/gophercloud/openstack/dns/v2/recordsets"
 	"github.com/gophercloud/gophercloud/openstack/dns/v2/zones"
 
@@ -26,7 +25,7 @@ func main() {
 }
 
 type designateDNSProviderSolver struct {
-	client *gophercloud.ServiceClient
+	client dnsClient
 }
 
 func New() webhook.Solver {
@@ -35,7 +34,7 @@ func New() webhook.Solver {
 		panic(fmt.Errorf("%v", err))
 	}
 	return &designateDNSProviderSolver{
-		client: client,
+		client: &gophercloudDNSClient{sc: client},
 	}
 }
 
@@ -46,85 +45,76 @@ func (c *designateDNSProviderSolver) Name() string {
 func (c *designateDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 	log.Debugf("Present() called ch.DNSName=%s ch.ResolvedZone=%s ch.ResolvedFQDN=%s ch.Type=%s", ch.DNSName, ch.ResolvedZone, ch.ResolvedFQDN, ch.Type)
 
-	listOpts := zones.ListOpts{
-		Name: ch.ResolvedZone,
+	zoneID, err := c.getZoneID(ch.ResolvedZone)
+	if err != nil {
+		return fmt.Errorf("Present: %w", err)
 	}
 
-	allPages, err := zones.List(c.client, listOpts).AllPages()
+	quotedKey := quoteRecord(ch.Key)
+
+	existing, err := c.findExistingRecordSet(zoneID, ch.ResolvedFQDN)
 	if err != nil {
 		return err
 	}
 
-	allZones, err := zones.ExtractZones(allPages)
-	if err != nil {
+	if existing != nil {
+		for _, r := range existing.Records {
+			if r == quotedKey {
+				log.Debugf("Record %s already exists in recordset %s, skipping", quotedKey, existing.ID)
+				return nil
+			}
+		}
+		opts := recordsets.UpdateOpts{
+			Records: append(existing.Records, quotedKey),
+		}
+		_, err = c.client.UpdateRecordSet(zoneID, existing.ID, opts)
 		return err
 	}
 
-	if len(allZones) != 1 {
-		return fmt.Errorf("Present: Expected to find 1 zone %s, found %v", ch.ResolvedZone, len(allZones))
+	opts := recordsets.CreateOpts{
+		Name:    ch.ResolvedFQDN,
+		Type:    "TXT",
+		Records: []string{quotedKey},
 	}
-
-	var opts recordsets.CreateOpts
-	opts.Name = ch.ResolvedFQDN
-	opts.Type = "TXT"
-	opts.Records = []string{quoteRecord(ch.Key)}
-
-	_, err = recordsets.Create(c.client, allZones[0].ID, opts).Extract()
-	if err != nil {
-		return err
-	}
-
-	return nil
+	_, err = c.client.CreateRecordSet(zoneID, opts)
+	return err
 }
 
 func (c *designateDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
 	log.Debugf("CleanUp called ch.ResolvedZone=%s ch.ResolvedFQDN=%s", ch.ResolvedZone, ch.ResolvedFQDN)
 
-	listOpts := zones.ListOpts{
-		Name: ch.ResolvedZone,
+	zoneID, err := c.getZoneID(ch.ResolvedZone)
+	if err != nil {
+		return fmt.Errorf("CleanUp: %w", err)
 	}
 
-	allPages, err := zones.List(c.client, listOpts).AllPages()
+	quotedKey := quoteRecord(ch.Key)
+
+	existing, err := c.findExistingRecordSet(zoneID, ch.ResolvedFQDN)
 	if err != nil {
 		return err
 	}
 
-	allZones, err := zones.ExtractZones(allPages)
-	if err != nil {
-		return err
+	if existing == nil {
+		return fmt.Errorf("CleanUp: no TXT recordset found for %s in zone %s", ch.ResolvedFQDN, ch.ResolvedZone)
 	}
 
-	if len(allZones) != 1 {
-		return fmt.Errorf("CleanUp: Expected to find 1 zone %s, found %v", ch.ResolvedZone, len(allZones))
+	var remaining []string
+	for _, r := range existing.Records {
+		if r != quotedKey {
+			remaining = append(remaining, r)
+		}
 	}
 
-	recordListOpts := recordsets.ListOpts{
-		Name: ch.ResolvedFQDN,
-		Type: "TXT",
-		Data: quoteRecord(ch.Key),
+	if len(remaining) == 0 {
+		return c.client.DeleteRecordSet(zoneID, existing.ID)
 	}
 
-	allRecordPages, err := recordsets.ListByZone(c.client, allZones[0].ID, recordListOpts).AllPages()
-
-	if err != nil {
-		return err
+	opts := recordsets.UpdateOpts{
+		Records: remaining,
 	}
-
-	allRRs, err := recordsets.ExtractRecordSets(allRecordPages)
-	if err != nil {
-		return err
-	}
-
-	if len(allRRs) != 1 {
-		return fmt.Errorf("CleanUp: Expected to find 1 recordset matching %s in zone %s, found %v", ch.ResolvedFQDN, ch.ResolvedZone, len(allRRs))
-	}
-
-	// TODO rather than deleting the whole recordset we may have to delete individual records from it, i.e. perform an update rather than a delete
-	err = recordsets.Delete(c.client, allZones[0].ID, allRRs[0].ID).ExtractErr()
-	if err != nil {
-		return err
-	}
-	return nil
+	_, err = c.client.UpdateRecordSet(zoneID, existing.ID, opts)
+	return err
 }
 
 func (c *designateDNSProviderSolver) Initialize(kubeClientConfig *rest.Config, stopCh <-chan struct{}) error {
@@ -135,8 +125,34 @@ func (c *designateDNSProviderSolver) Initialize(kubeClientConfig *rest.Config, s
 		return err
 	}
 
-	c.client = cl
+	c.client = &gophercloudDNSClient{sc: cl}
 	return nil
+}
+
+func (c *designateDNSProviderSolver) getZoneID(resolvedZone string) (string, error) {
+	allZones, err := c.client.ListZones(zones.ListOpts{Name: resolvedZone})
+	if err != nil {
+		return "", err
+	}
+	if len(allZones) != 1 {
+		return "", fmt.Errorf("expected to find 1 zone %s, found %d", resolvedZone, len(allZones))
+	}
+	return allZones[0].ID, nil
+}
+
+func (c *designateDNSProviderSolver) findExistingRecordSet(zoneID, fqdn string) (*recordsets.RecordSet, error) {
+	opts := recordsets.ListOpts{
+		Name: fqdn,
+		Type: "TXT",
+	}
+	allRRs, err := c.client.ListRecordSetsByZone(zoneID, opts)
+	if err != nil {
+		return nil, err
+	}
+	if len(allRRs) == 0 {
+		return nil, nil
+	}
+	return &allRRs[0], nil
 }
 
 func quoteRecord(r string) string {
