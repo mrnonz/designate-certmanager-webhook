@@ -64,9 +64,7 @@ func (c *designateDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) erro
 				return nil
 			}
 		}
-		opts := recordsets.UpdateOpts{
-			Records: append(existing.Records, quotedKey),
-		}
+		opts := buildUpdateOpts(existing, append(existing.Records, quotedKey))
 		_, err = c.client.UpdateRecordSet(zoneID, existing.ID, opts)
 		return err
 	}
@@ -110,9 +108,7 @@ func (c *designateDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) erro
 		return c.client.DeleteRecordSet(zoneID, existing.ID)
 	}
 
-	opts := recordsets.UpdateOpts{
-		Records: remaining,
-	}
+	opts := buildUpdateOpts(existing, remaining)
 	_, err = c.client.UpdateRecordSet(zoneID, existing.ID, opts)
 	return err
 }
@@ -153,6 +149,33 @@ func (c *designateDNSProviderSolver) findExistingRecordSet(zoneID, fqdn string) 
 		return nil, nil
 	}
 	return &allRRs[0], nil
+}
+
+// fullUpdateOpts extends the standard UpdateOpts with a Type field so the PUT
+// body matches what strict API gateways expect (description + ttl + type + records).
+type fullUpdateOpts struct {
+	Description string   `json:"description"`
+	TTL         int      `json:"ttl"`
+	Type        string   `json:"type"`
+	Records     []string `json:"records"`
+}
+
+func (o fullUpdateOpts) ToRecordSetUpdateMap() (map[string]interface{}, error) {
+	return map[string]interface{}{
+		"description": o.Description,
+		"ttl":         o.TTL,
+		"type":        o.Type,
+		"records":     o.Records,
+	}, nil
+}
+
+func buildUpdateOpts(existing *recordsets.RecordSet, records []string) fullUpdateOpts {
+	return fullUpdateOpts{
+		Description: existing.Description,
+		TTL:         existing.TTL,
+		Type:        existing.Type,
+		Records:     records,
+	}
 }
 
 func quoteRecord(r string) string {

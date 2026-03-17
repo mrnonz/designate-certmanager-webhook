@@ -75,13 +75,24 @@ func (m *mockDNSClient) CreateRecordSet(zoneID string, opts recordsets.CreateOpt
 
 func (m *mockDNSClient) UpdateRecordSet(zoneID string, rrsetID string, opts recordsets.UpdateOptsBuilder) (*recordsets.RecordSet, error) {
 	m.updateCalls++
-	uo, ok := opts.(recordsets.UpdateOpts)
-	if !ok {
-		return nil, fmt.Errorf("unexpected opts type %T", opts)
+	body, err := opts.ToRecordSetUpdateMap()
+	if err != nil {
+		return nil, err
 	}
 	for i, rr := range m.recordSets[zoneID] {
 		if rr.ID == rrsetID {
-			m.recordSets[zoneID][i].Records = uo.Records
+			if recs, ok := body["records"].([]string); ok {
+				m.recordSets[zoneID][i].Records = recs
+			}
+			if desc, ok := body["description"].(string); ok {
+				m.recordSets[zoneID][i].Description = desc
+			}
+			if ttl, ok := body["ttl"].(int); ok {
+				m.recordSets[zoneID][i].TTL = ttl
+			}
+			if typ, ok := body["type"].(string); ok {
+				m.recordSets[zoneID][i].Type = typ
+			}
 			updated := m.recordSets[zoneID][i]
 			return &updated, nil
 		}
@@ -323,6 +334,78 @@ func TestFindExistingRecordSet_IgnoresNonTXTRecords(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Nil(t, rs)
+}
+
+// --- buildUpdateOpts tests ---
+
+func TestBuildUpdateOpts_CarriesOverAllFields(t *testing.T) {
+	existing := &recordsets.RecordSet{
+		Description: "my desc",
+		TTL:         300,
+		Type:        "TXT",
+		Records:     []string{`"old"`},
+	}
+	newRecords := []string{`"old"`, `"new"`}
+
+	opts := buildUpdateOpts(existing, newRecords)
+
+	assert.Equal(t, "my desc", opts.Description)
+	assert.Equal(t, 300, opts.TTL)
+	assert.Equal(t, "TXT", opts.Type)
+	assert.Equal(t, newRecords, opts.Records)
+
+	body, err := opts.ToRecordSetUpdateMap()
+	require.NoError(t, err)
+	assert.Equal(t, "my desc", body["description"])
+	assert.Equal(t, 300, body["ttl"])
+	assert.Equal(t, "TXT", body["type"])
+	assert.Equal(t, newRecords, body["records"])
+}
+
+func TestBuildUpdateOpts_HandlesZeroTTLAndEmptyDescription(t *testing.T) {
+	existing := &recordsets.RecordSet{
+		Description: "",
+		TTL:         0,
+		Type:        "TXT",
+		Records:     []string{`"a"`},
+	}
+	opts := buildUpdateOpts(existing, []string{`"a"`, `"b"`})
+
+	assert.Equal(t, "", opts.Description)
+	assert.Equal(t, 0, opts.TTL)
+	assert.Equal(t, "TXT", opts.Type)
+
+	body, err := opts.ToRecordSetUpdateMap()
+	require.NoError(t, err)
+	assert.Equal(t, "", body["description"])
+	assert.Equal(t, 0, body["ttl"])
+	assert.Equal(t, "TXT", body["type"])
+}
+
+func TestPresent_PreservesDescriptionAndTTLOnUpdate(t *testing.T) {
+	mock := newMockDNSClient()
+	setupMockWithZone(mock)
+	mock.recordSets[testZoneID] = []recordsets.RecordSet{
+		{
+			ID:          "existing-rs",
+			ZoneID:      testZoneID,
+			Name:        testFQDN,
+			Type:        "TXT",
+			TTL:         600,
+			Description: "acme challenge",
+			Records:     []string{`"old-token"`},
+		},
+	}
+	solver := solverWithMock(mock)
+
+	ch := newChallengeRequest(testZoneName, testFQDN, "new-token")
+	err := solver.Present(ch)
+
+	require.NoError(t, err)
+	rs := mock.recordSets[testZoneID][0]
+	assert.Equal(t, 600, rs.TTL)
+	assert.Equal(t, "acme challenge", rs.Description)
+	assert.Equal(t, []string{`"old-token"`, `"new-token"`}, rs.Records)
 }
 
 // --- Integration-style: Present then CleanUp ---
